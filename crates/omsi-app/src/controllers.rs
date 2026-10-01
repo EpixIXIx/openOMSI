@@ -272,15 +272,23 @@ impl Devices {
     pub fn poll(&mut self) -> Vec<(String, usize, bool)> {
         let mut out = Vec::new();
         let di = self.direct_input();
+        #[cfg(windows)]
+        if let Some(d) = self.di.as_mut() {
+            d.poll();
+        }
         if let Some(g) = self.gilrs.as_mut() {
             while let Some(ev) = g.next_event() {
                 let pad = g.gamepad(ev.id);
+                #[cfg(windows)]
+                let wheel_twin = self.di.as_ref().is_some_and(|d| direct_input_wheel_twin(d, &pad));
+                #[cfg(not(windows))]
+                let wheel_twin = false;
                 match ev.event {
                     EventType::Connected => log::info!("game controller connected: {} (layout {:?}, DirectInput {})", pad.name(), pad.mapping_source(), di),
                     // DirectInput handles wheels on Windows; system-mapped gamepads
                     // such as Xbox controllers are listed through gilrs.
                     EventType::ButtonPressed(_, code) | EventType::ButtonReleased(_, code)
-                        if use_gilrs_buttons(di, pad.mapping_source() == gilrs::MappingSource::Driver) => {
+                        if use_gilrs_buttons(di, pad.mapping_source() == gilrs::MappingSource::Driver, wheel_twin) => {
                         out.push((pad.name().to_string(), button_number(&pad, code), matches!(ev.event, EventType::ButtonPressed(..))));
                     }
                     _ => {}
@@ -289,7 +297,6 @@ impl Devices {
         }
         #[cfg(windows)]
         if let Some(d) = self.di.as_mut() {
-            d.poll();
             out.append(&mut d.events);
         }
         #[cfg(target_os = "macos")]
@@ -365,8 +372,17 @@ impl Devices {
     }
 }
 
-fn use_gilrs_buttons(direct_input: bool, system_gamepad: bool) -> bool {
-    !direct_input || system_gamepad
+fn use_gilrs_buttons(direct_input: bool, system_gamepad: bool, wheel_twin: bool) -> bool {
+    (!direct_input || system_gamepad) && !wheel_twin
+}
+
+/// A force-feedback wheel can appear in Windows' gamepad API as well as DirectInput.
+/// Its default gamepad mapping may call a pedal a button; DirectInput owns that wheel.
+#[cfg(windows)]
+fn direct_input_wheel_twin(di: &crate::dinput::DirectInput, pad: &gilrs::Gamepad<'_>) -> bool {
+    let id = pad.vendor_id().zip(pad.product_id());
+    di.devices.iter().any(|d| d.ff_capable()
+        && (names_match(&d.name, pad.name()) || id.is_some_and(|id| d.hardware_id == Some(id))))
 }
 
 /// A DirectInput name of an Xbox-type pad (which gilrs lists with the system's layout).
@@ -575,6 +591,10 @@ impl Controllers {
         let off = self.disabled.clone();
         if let Some(g) = self.devices.gilrs.as_ref() {
             for (_, pad) in g.gamepads() {
+                #[cfg(windows)]
+                if self.devices.di.as_ref().is_some_and(|di| direct_input_wheel_twin(di, &pad)) {
+                    continue;
+                }
                 // (a pad OMSI's gamectrler.cfg names is driven by that file through DirectInput
                 // - except an Xbox-type pad on Windows, whose DirectInput twin is left out
                 // for the system's own layout: with the file naming it, nobody read it, and
@@ -978,6 +998,7 @@ mod tests {
     #[test]
     fn names() {
         assert!(super::names_match("Logitech G25 Racing Wheel USB", "Logitech G25 Racing Wheel"));
+        assert!(super::names_match("Logitech Driving Force GT USB", "Logitech Driving Force"));
         assert!(!super::names_match("", "x"));
         assert!(super::names_match("Кнопочная панель", "кнопочная  панель"));
         assert!(!super::names_match("Кнопочная панель", "Руль"));
@@ -991,9 +1012,10 @@ mod tests {
 
     #[test]
     fn system_gamepad_buttons_work_alongside_direct_input_wheels() {
-        assert!(super::use_gilrs_buttons(true, true));
-        assert!(!super::use_gilrs_buttons(true, false));
-        assert!(super::use_gilrs_buttons(false, false));
+        assert!(super::use_gilrs_buttons(true, true, false));
+        assert!(!super::use_gilrs_buttons(true, false, false));
+        assert!(!super::use_gilrs_buttons(true, true, true));
+        assert!(super::use_gilrs_buttons(false, false, false));
     }
 }
 
